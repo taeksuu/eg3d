@@ -39,6 +39,7 @@ class Dataset(torch.utils.data.Dataset):
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._smpl_shape = None
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -65,6 +66,20 @@ class Dataset(torch.utils.data.Dataset):
                 assert np.all(self._raw_labels >= 0)
             self._raw_labels_std = self._raw_labels.std(0)
         return self._raw_labels
+    
+    def _get_raw_smpls(self):
+        if self._raw_smpls is None:
+            self._raw_smpls = self._load_raw_smpls() if self._use_labels else None
+            if self._raw_smpls is None:
+                self._raw_smpls = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
+            assert isinstance(self._raw_smpls, np.ndarray)
+            assert self._raw_smpls.shape[0] == self._raw_shape[0]
+            assert self._raw_smpls.dtype in [np.float32, np.int64]
+            if self._raw_smpls.dtype == np.int64:
+                assert self._raw_smpls.ndim == 1
+                assert np.all(self._raw_smpls >= 0)
+            self._raw_smpls_std = self._raw_smpls.std(0)
+        return self._raw_smpls
 
     def close(self): # to be overridden by subclass
         pass
@@ -95,10 +110,18 @@ class Dataset(torch.utils.data.Dataset):
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        return image.copy(), self.get_label(idx)
+        return image.copy(), self.get_label(idx), self.get_smpl(idx)
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
+        if label.dtype == np.int64:
+            onehot = np.zeros(self.label_shape, dtype=np.float32)
+            onehot[label] = 1
+            label = onehot
+        return label.copy()
+    
+    def get_smpl(self, idx):
+        label = self._get_raw_smpls()[self._raw_idx[idx]]
         if label.dtype == np.int64:
             onehot = np.zeros(self.label_shape, dtype=np.float32)
             onehot[label] = 1
@@ -143,11 +166,26 @@ class Dataset(torch.utils.data.Dataset):
             else:
                 self._label_shape = raw_labels.shape[1:]
         return list(self._label_shape)
+    
+    @property
+    def smpl_shape(self):
+        if self._smpl_shape is None:
+            raw_smpls = self._get_raw_smpls()
+            if raw_smpls.dtype == np.int64:
+                self._smpl_shape = [int(np.max(raw_smpls)) + 1]
+            else:
+                self._smpl_shape = raw_smpls.shape[1:]
+        return list(self._smpl_shape)
 
     @property
     def label_dim(self):
         assert len(self.label_shape) == 1
         return self.label_shape[0]
+    
+    @property
+    def smpl_dim(self):
+        assert len(self.smpl_shape) == 1
+        return self.smpl_shape[0]
 
     @property
     def has_labels(self):
@@ -233,6 +271,20 @@ class ImageFolderDataset(Dataset):
             return None
         with self._open_file(fname) as f:
             labels = json.load(f)['labels']
+        if labels is None:
+            return None
+        labels = dict(labels)
+        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+        labels = np.array(labels)
+        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        return labels
+    
+    def _load_raw_smpls(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            labels = json.load(f)['smpls']
         if labels is None:
             return None
         labels = dict(labels)
