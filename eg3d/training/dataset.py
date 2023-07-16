@@ -38,6 +38,7 @@ class Dataset(torch.utils.data.Dataset):
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._raw_labels = None
+        self._raw_smpls = None
         self._label_shape = None
         self._smpl_shape = None
 

@@ -36,8 +36,8 @@ def generate_planes():
                             [0, 0, 1],
                             [0, 1, 0]],
                             [[0, 0, 1],
-                            [1, 0, 0],
-                            [0, 1, 0]]], dtype=torch.float32)
+                            [0, 1, 0],
+                            [1, 0, 0]]], dtype=torch.float32)
 
 def project_onto_planes(planes, coordinates):
     """
@@ -116,6 +116,7 @@ class ImportanceRenderer(torch.nn.Module):
         out = self.run_model(planes, smpl, decoder, sample_coordinates, sample_directions, rendering_options)
         colors_coarse = out['rgb']
         densities_coarse = out['sigma']
+        defomer_weight_diffs = out['deformer_weight_diffs']
         colors_coarse = colors_coarse.reshape(batch_size, num_rays, samples_per_ray, colors_coarse.shape[-1])
         densities_coarse = densities_coarse.reshape(batch_size, num_rays, samples_per_ray, 1)
 
@@ -132,7 +133,7 @@ class ImportanceRenderer(torch.nn.Module):
             out = self.run_model(planes, smpl, decoder, sample_coordinates, sample_directions, rendering_options)
             colors_fine = out['rgb']
             densities_fine = out['sigma']
-            normal = out['normal']
+            defomer_weight_diffs += out['deformer_weight_diffs']
             colors_fine = colors_fine.reshape(batch_size, num_rays, N_importance, colors_fine.shape[-1])
             densities_fine = densities_fine.reshape(batch_size, num_rays, N_importance, 1)
 
@@ -145,15 +146,13 @@ class ImportanceRenderer(torch.nn.Module):
             rgb_final, depth_final, weights = self.ray_marcher(colors_coarse, densities_coarse, depths_coarse, rendering_options)
 
 
-        return rgb_final, depth_final, weights.sum(2), normal
+        return rgb_final, depth_final, weights.sum(2), defomer_weight_diffs
 
     def run_model(self, planes, smpl, decoder, sample_coordinates, sample_directions, options):
 
         b, _ = smpl.shape
-        scale_transl = torch.zeros((b, 4), device=smpl.device)
-        scale_transl[:, 0] = 1
 
-        smpl_output = self.smpl_server(torch.cat([scale_transl, smpl], axis=1), absolute=True)
+        smpl_output = self.smpl_server(smpl, absolute=True)
 
         smpl_tfs = smpl_output['smpl_tfs']
         smpl_tfs = torch.einsum('bnij,njk->bnik', smpl_tfs.to(smpl.device), self.smpl_server.tfs_c_inv.to(smpl.device))
@@ -162,18 +161,24 @@ class ImportanceRenderer(torch.nn.Module):
         num_batch, num_point, num_init, num_dim = pts_c.shape
         pts_c = pts_c.reshape(num_batch, num_point * num_init, num_dim)
 
+
         sampled_features = sample_from_planes(self.plane_axes, planes, pts_c, padding_mode='zeros', box_warp=options['box_warp'])
+        out = decoder(sampled_features, sample_directions)
 
-        out = decoder(pts_c, smpl, sampled_features, sample_directions)
-
-        # out['sigma'] = out['sigma'].reshape(b, -1, 5, 1)
-        # out['rgb'] = out['rgb'].reshape(b, -1, 5, 32)
+        out['sigma'] = out['sigma'].reshape(num_batch, -1, num_init, 1)
+        out['rgb'] = out['rgb'].reshape(num_batch, -1, num_init, 32)
+        pts_c = pts_c.reshape(num_batch, -1, num_init, 3)
         # out['normal'] = out['normal'].reshape(b, -1, 5, 3)
 
-        # out['sigma'], idx_c = out['sigma'].max(dim=2)
-        # out['rgb'] = torch.gather(out['rgb'], 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, out['rgb'].shape[-1])).squeeze(2)
+        out['sigma'], idx_c = out['sigma'].max(dim=2)
+        out['rgb'] = torch.gather(out['rgb'], 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, out['rgb'].shape[-1])).squeeze(2)
         # out['normal'] = torch.gather(out['normal'], 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, out['normal'].shape[-1])).squeeze(2)
-
+        pts_c = torch.gather(pts_c, 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, pts_c.shape[-1])).squeeze(2)
+        
+        nn_weights = torch.nn.functional.grid_sample(self.deformer.nn_smpl_weights.repeat(num_batch,1,1,1,1), pts_c[:,:,None,None,:3], mode='bilinear', padding_mode='border', align_corners=True).reshape(num_batch, num_point, 24)
+        queried_weights = self.deformer.query_weights(pts_c)
+        deformer_weight_diffs = torch.nn.functional.mse_loss(nn_weights, queried_weights)
+        out['deformer_weight_diffs'] = deformer_weight_diffs
 
         if options.get('density_noise', 0) > 0:
             out['sigma'] += torch.randn_like(out['sigma']) * options['density_noise']

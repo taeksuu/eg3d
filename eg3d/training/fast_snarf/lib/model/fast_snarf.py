@@ -69,6 +69,8 @@ class ForwardDeformer(torch.nn.Module):
 
         self.grid_denorm = grid/self.scale - self.offset
 
+        self.nn_smpl_weights = query_weights_smpl(self.grid_denorm, smpl_verts, smpl_server.weights_c).permute(1, 0).reshape(1,-1,d,h,w)
+
         if self.skinning_mode == 'preset':
             self.lbs_voxel_final = query_weights_smpl(self.grid_denorm, smpl_verts, smpl_server.weights_c)
             self.lbs_voxel_final = self.lbs_voxel_final.permute(0,2,1).reshape(1,-1,d,h,w)

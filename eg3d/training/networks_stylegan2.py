@@ -107,6 +107,8 @@ class FullyConnectedLayer(torch.nn.Module):
         self.out_features = out_features
         self.activation = activation
         self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) / lr_multiplier)
+        # self.weight_norm = weight_norm
+        # if self.weight_norm: self.weight = torch.nn.utils.weight_norm(self.weight)
         self.bias = torch.nn.Parameter(torch.full([out_features], np.float32(bias_init))) if bias else None
         self.weight_gain = lr_multiplier / np.sqrt(in_features)
         self.bias_gain = lr_multiplier

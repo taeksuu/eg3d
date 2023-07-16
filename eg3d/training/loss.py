@@ -54,7 +54,7 @@ class StyleGAN2Loss(Loss):
         self.blur_raw_target = True
         assert self.gpc_reg_prob is None or (0 <= self.gpc_reg_prob <= 1)
 
-    def run_G(self, z, c, swapping_prob, neural_rendering_resolution, update_emas=False):
+    def run_G(self, z, c, smpl, swapping_prob, neural_rendering_resolution, update_emas=False):
         if swapping_prob is not None:
             c_swapped = torch.roll(c.clone(), 1, 0)
             c_gen_conditioning = torch.where(torch.rand((c.shape[0], 1), device=c.device) < swapping_prob, c_swapped, c)
@@ -67,8 +67,8 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
-        gen_output = self.G.synthesis(ws, c, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
-        return gen_output, ws
+        gen_output, deformer_weight_diffs = self.G.synthesis(ws, c, smpl, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
+        return gen_output, ws, deformer_weight_diffs
 
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
@@ -87,7 +87,7 @@ class StyleGAN2Loss(Loss):
         logits = self.D(img, c, update_emas=update_emas)
         return logits
 
-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
+    def accumulate_gradients(self, phase, real_img, real_c, real_smpl, gen_z, gen_c, gen_smpl, gain, cur_nimg):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         if self.G.rendering_kwargs.get('density_reg', 0) == 0:
             phase = {'Greg': 'none', 'Gboth': 'Gmain'}.get(phase, phase)
@@ -118,14 +118,16 @@ class StyleGAN2Loss(Loss):
         # Gmain: Maximize logits for generated images.
         if phase in ['Gmain', 'Gboth']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
-                gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
+                gen_img, _gen_ws, deformer_weight_diffs = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
-                loss_Gmain = torch.nn.functional.softplus(-gen_logits)
+                training_stats.report('Loss/deformer/', deformer_weight_diffs)
+                loss_Gmain = torch.nn.functional.softplus(-gen_logits).mean() + 10 * deformer_weight_diffs 
                 training_stats.report('Loss/G/loss', loss_Gmain)
             with torch.autograd.profiler.record_function('Gmain_backward'):
-                loss_Gmain.mean().mul(gain).backward()
+                loss_Gmain.mul(gain).backward()
+
 
         # Density Regularization
         if phase in ['Greg', 'Gboth'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
@@ -144,7 +146,7 @@ class StyleGAN2Loss(Loss):
             initial_coordinates = torch.rand((ws.shape[0], 1000, 3), device=ws.device) * 2 - 1
             perturbed_coordinates = initial_coordinates + torch.randn_like(initial_coordinates) * self.G.rendering_kwargs['density_reg_p_dist']
             all_coordinates = torch.cat([initial_coordinates, perturbed_coordinates], dim=1)
-            sigma = self.G.sample_mixed(all_coordinates, torch.randn_like(all_coordinates), ws, update_emas=False)['sigma']
+            sigma = self.G.sample_mixed(all_coordinates, gen_smpl, torch.randn_like(all_coordinates), ws, update_emas=False)['sigma']
             sigma_initial = sigma[:, :sigma.shape[1]//2]
             sigma_perturbed = sigma[:, sigma.shape[1]//2:]
 
@@ -243,7 +245,7 @@ class StyleGAN2Loss(Loss):
         loss_Dgen = 0
         if phase in ['Dmain', 'Dboth']:
             with torch.autograd.profiler.record_function('Dgen_forward'):
-                gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution, update_emas=True)
+                gen_img, _gen_ws, _ = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution, update_emas=True)
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, update_emas=True)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())

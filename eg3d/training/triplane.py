@@ -11,8 +11,8 @@
 import torch
 from torch_utils import persistence
 from training.networks_stylegan2 import Generator as StyleGAN2Backbone
-from training.volumetric_rendering.renderer import ImportanceRenderer
-from training.volumetric_rendering.ray_sampler import RaySampler
+from training.volumetric_rendering_AG3D.renderer import ImportanceRenderer
+from training.volumetric_rendering_AG3D.ray_sampler import RaySampler
 import dnnlib
 
 @persistence.persistent_class
@@ -33,6 +33,7 @@ class TriPlaneGenerator(torch.nn.Module):
         self.z_dim=z_dim
         self.c_dim=c_dim
         self.w_dim=w_dim
+        self.smpl_dim=86
         self.img_resolution=img_resolution
         self.img_channels=img_channels
         self.renderer = ImportanceRenderer()
@@ -50,7 +51,7 @@ class TriPlaneGenerator(torch.nn.Module):
                 c = torch.zeros_like(c)
         return self.backbone.mapping(z, c * self.rendering_kwargs.get('c_scale', 0), truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
 
-    def synthesis(self, ws, c, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+    def synthesis(self, ws, c, smpl, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         cam2world_matrix = c[:, :16].view(-1, 4, 4)
         intrinsics = c[:, 16:25].view(-1, 3, 3)
 
@@ -75,7 +76,7 @@ class TriPlaneGenerator(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
 
         # Perform volume rendering
-        feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+        feature_samples, depth_samples, weights_samples, deformer_weight_diffs = self.renderer(planes, smpl, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
 
         # Reshape into 'raw' neural-rendered image
         H = W = self.neural_rendering_resolution
@@ -86,7 +87,7 @@ class TriPlaneGenerator(torch.nn.Module):
         rgb_image = feature_image[:, :3]
         sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
 
-        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
+        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}, deformer_weight_diffs
     
     def sample(self, coordinates, directions, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Compute RGB features, density for arbitrary 3D coordinates. Mostly used for extracting shapes. 
@@ -95,16 +96,16 @@ class TriPlaneGenerator(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
         return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
 
-    def sample_mixed(self, coordinates, directions, ws, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+    def sample_mixed(self, coordinates, smpl, directions, ws, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Same as sample, but expects latent vectors 'ws' instead of Gaussian noise 'z'
         planes = self.backbone.synthesis(ws, update_emas = update_emas, **synthesis_kwargs)
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
-        return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
+        return self.renderer.run_model(planes, smpl, self.decoder, coordinates, directions, self.rendering_kwargs)
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+    def forward(self, z, c, smpl, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         # Render a batch of generated images.
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
-        return self.synthesis(ws, c, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
+        return self.synthesis(ws, c, smpl, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
 
 
 from training.networks_stylegan2 import FullyConnectedLayer

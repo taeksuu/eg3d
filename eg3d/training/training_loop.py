@@ -37,38 +37,42 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
     gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
 
-    # No labels => show random subset of training samples.
-    if not training_set.has_labels:
-        all_indices = list(range(len(training_set)))
-        rnd.shuffle(all_indices)
-        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
+    all_indices = list(range(len(training_set)))
+    rnd.shuffle(all_indices)
+    grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
 
-    else:
-        # Group training samples by label.
-        label_groups = dict() # label => [idx, ...]
-        for idx in range(len(training_set)):
-            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
-            if label not in label_groups:
-                label_groups[label] = []
-            label_groups[label].append(idx)
+    # # No labels => show random subset of training samples.
+    # if not training_set.has_labels:
+    #     all_indices = list(range(len(training_set)))
+    #     rnd.shuffle(all_indices)
+    #     grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
 
-        # Reorder.
-        label_order = list(label_groups.keys())
-        rnd.shuffle(label_order)
-        for label in label_order:
-            rnd.shuffle(label_groups[label])
+    # else:
+    #     # Group training samples by label.
+    #     label_groups = dict() # label => [idx, ...]
+    #     for idx in range(len(training_set)):
+    #         label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
+    #         if label not in label_groups:
+    #             label_groups[label] = []
+    #         label_groups[label].append(idx)
 
-        # Organize into grid.
-        grid_indices = []
-        for y in range(gh):
-            label = label_order[y % len(label_order)]
-            indices = label_groups[label]
-            grid_indices += [indices[x % len(indices)] for x in range(gw)]
-            label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
+    #     # Reorder.
+    #     label_order = list(label_groups.keys())
+    #     rnd.shuffle(label_order)
+    #     for label in label_order:
+    #         rnd.shuffle(label_groups[label])
+
+    #     # Organize into grid.
+    #     grid_indices = []
+    #     for y in range(gh):
+    #         label = label_order[y % len(label_order)]
+    #         indices = label_groups[label]
+    #         grid_indices += [indices[x % len(indices)] for x in range(gw)]
+    #         label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(labels)
+    images, labels, smpls = zip(*[training_set[i] for i in grid_indices])
+    return (gw, gh), np.stack(images), np.stack(labels), np.stack(smpls)
 
 #----------------------------------------------------------------------------
 
@@ -150,6 +154,7 @@ def training_loop(
         print('Num images: ', len(training_set))
         print('Image shape:', training_set.image_shape)
         print('Label shape:', training_set.label_shape)
+        print('SMPL shape:', training_set.smpl_shape)
         print()
 
     # Construct networks.
@@ -173,7 +178,8 @@ def training_loop(
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
-        img = misc.print_module_summary(G, [z, c])
+        smpl = torch.empty([batch_gpu, G.smpl_dim], device=device)
+        img, _ = misc.print_module_summary(G, [z, c, smpl])
         misc.print_module_summary(D, [img, c])
 
     # Setup augmentation.
@@ -224,12 +230,14 @@ def training_loop(
     grid_size = None
     grid_z = None
     grid_c = None
+    grid_smpl = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+        grid_size, images, labels, smpls = setup_snapshot_image_grid(training_set=training_set)
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+        grid_smpl = torch.from_numpy(smpls).to(device).split(batch_gpu)
 
     # Initialize logs.
     if rank == 0:
@@ -262,17 +270,21 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            phase_real_img, phase_real_c, phase_real_smpl = next(training_set_iterator)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
+            phase_real_smpl = phase_real_smpl.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
+            all_gen_smpl = [training_set.get_smpl(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+            all_gen_smpl = torch.from_numpy(np.stack(all_gen_smpl)).pin_memory().to(device)
+            all_gen_smpl = [phase_gen_pose.split(batch_gpu) for phase_gen_pose in all_gen_smpl.split(batch_size)]
 
         # Execute training phases.
-        for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
+        for phase, phase_gen_z, phase_gen_c, phase_gen_smpl in zip(phases, all_gen_z, all_gen_c, all_gen_smpl):
             if batch_idx % phase.interval != 0:
                 continue
             if phase.start_event is not None:
@@ -281,8 +293,8 @@ def training_loop(
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+            for real_img, real_c, real_smpl, gen_z, gen_c, gen_smpl in zip(phase_real_img, phase_real_c, phase_real_smpl, phase_gen_z, phase_gen_c, phase_gen_smpl):
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, real_smpl=real_smpl, gen_z=gen_z, gen_c=gen_c, gen_smpl=gen_smpl, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
 
             # Update weights.
@@ -359,7 +371,7 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            out = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
+            out = [G_ema(z=z, c=c, smpl=smpl, noise_mode='const')[0] for z, c, smpl in zip(grid_z, grid_c, grid_smpl)]
             images = torch.cat([o['image'].cpu() for o in out]).numpy()
             images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
             images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
@@ -395,7 +407,7 @@ def training_loop(
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks*20 == 0):
             snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
             for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment_pipe', augment_pipe)]:
                 if module is not None:

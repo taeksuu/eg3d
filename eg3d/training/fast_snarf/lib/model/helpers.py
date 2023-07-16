@@ -10,11 +10,20 @@ import pytorch3d.ops as ops
 
 def query_weights_smpl(x, smpl_verts, smpl_weights):
     
-    distance_batch, index_batch, neighbor_points  = ops.knn_points(x,smpl_verts,K=1,return_nn=True)
+    distance_batch, index_batch, neighbor_points  = ops.knn_points(x,smpl_verts,K=30,return_nn=True)
 
     index_batch = index_batch[0]
+    distance_batch = distance_batch[0]
+    distance_batch = torch.clamp(distance_batch, 0.0001)
 
-    skinning_weights = smpl_weights[:,index_batch][:,:,0,:]
+    ws = 1.0 / distance_batch
+    ws = ws / ws.sum(-1, keepdim=True)
+
+    skinning_weights = (smpl_weights[0][index_batch.view(-1)] * ws.view(-1, 1)).reshape(ws.shape[0], 30, -1).sum(1)
+    sums=skinning_weights.sum(1,keepdim=True)
+    skinning_weights = skinning_weights / sums
+    
+    # skinning_weights = smpl_weights[:,index_batch][:,:,0,:]
 
     return skinning_weights
 
