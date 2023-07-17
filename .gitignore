@@ -22,6 +22,7 @@ imgs/
 vids/
 *.mp4
 
+training-runs/
 stylegan3/results
 eg3d/results
 eg3d_results

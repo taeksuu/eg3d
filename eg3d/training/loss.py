@@ -67,8 +67,8 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
-        gen_output, deformer_weight_diffs = self.G.synthesis(ws, c, smpl, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
-        return gen_output, ws, deformer_weight_diffs
+        gen_output, deformer_weight_diffs, eikonal, zero_delta_sdf = self.G.synthesis(ws, c, smpl, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
+        return gen_output, ws, deformer_weight_diffs, eikonal, zero_delta_sdf
 
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
@@ -118,12 +118,14 @@ class StyleGAN2Loss(Loss):
         # Gmain: Maximize logits for generated images.
         if phase in ['Gmain', 'Gboth']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
-                gen_img, _gen_ws, deformer_weight_diffs = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
+                gen_img, _gen_ws, deformer_weight_diffs, eikonal, zero_delta_sdf = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
                 training_stats.report('Loss/deformer/', deformer_weight_diffs)
-                loss_Gmain = torch.nn.functional.softplus(-gen_logits).mean() + 10 * deformer_weight_diffs 
+                training_stats.report('Loss/eikonal/', eikonal)
+                training_stats.report('Loss/zero_delta_sdf/', zero_delta_sdf)
+                loss_Gmain = torch.nn.functional.softplus(-gen_logits).mean() + 100 * deformer_weight_diffs + eikonal + 10 * zero_delta_sdf
                 training_stats.report('Loss/G/loss', loss_Gmain)
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 loss_Gmain.mul(gain).backward()
@@ -245,11 +247,14 @@ class StyleGAN2Loss(Loss):
         loss_Dgen = 0
         if phase in ['Dmain', 'Dboth']:
             with torch.autograd.profiler.record_function('Dgen_forward'):
-                gen_img, _gen_ws, _ = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution, update_emas=True)
+                gen_img, _gen_ws, deformer_weight_diffs, eikonal, zero_delta_sdf = self.run_G(gen_z, gen_c, gen_smpl, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution, update_emas=True)
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, update_emas=True)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
-                loss_Dgen = torch.nn.functional.softplus(gen_logits)
+                training_stats.report('Loss/deformer/', deformer_weight_diffs)
+                training_stats.report('Loss/eikonal/', eikonal)
+                training_stats.report('Loss/zero_delta_sdf/', zero_delta_sdf)
+                loss_Dgen = torch.nn.functional.softplus(gen_logits) + 100 * deformer_weight_diffs + eikonal + 10 * zero_delta_sdf
             with torch.autograd.profiler.record_function('Dgen_backward'):
                 loss_Dgen.mean().mul(gain).backward()
 

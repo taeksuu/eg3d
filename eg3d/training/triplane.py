@@ -51,7 +51,7 @@ class TriPlaneGenerator(torch.nn.Module):
                 c = torch.zeros_like(c)
         return self.backbone.mapping(z, c * self.rendering_kwargs.get('c_scale', 0), truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
 
-    def synthesis(self, ws, c, smpl, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+    def synthesis(self, ws, c, smpl, canonical=False, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         cam2world_matrix = c[:, :16].view(-1, 4, 4)
         intrinsics = c[:, 16:25].view(-1, 3, 3)
 
@@ -76,7 +76,7 @@ class TriPlaneGenerator(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
 
         # Perform volume rendering
-        feature_samples, depth_samples, weights_samples, deformer_weight_diffs = self.renderer(planes, smpl, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+        feature_samples, depth_samples, weights_samples, deformer_weight_diffs, normal, zero_delta_sdf = self.renderer(planes, smpl, self.decoder, canonical, ray_origins, ray_directions, self.rendering_kwargs) # channels last
 
         # Reshape into 'raw' neural-rendered image
         H = W = self.neural_rendering_resolution
@@ -87,7 +87,7 @@ class TriPlaneGenerator(torch.nn.Module):
         rgb_image = feature_image[:, :3]
         sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
 
-        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}, deformer_weight_diffs
+        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}, deformer_weight_diffs, normal, zero_delta_sdf
     
     def sample(self, coordinates, directions, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Compute RGB features, density for arbitrary 3D coordinates. Mostly used for extracting shapes. 
@@ -96,35 +96,38 @@ class TriPlaneGenerator(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
         return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
 
-    def sample_mixed(self, coordinates, smpl, directions, ws, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+    def sample_mixed(self, coordinates, smpl, directions, ws, canonical=False, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Same as sample, but expects latent vectors 'ws' instead of Gaussian noise 'z'
         planes = self.backbone.synthesis(ws, update_emas = update_emas, **synthesis_kwargs)
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
-        return self.renderer.run_model(planes, smpl, self.decoder, coordinates, directions, self.rendering_kwargs)
+        return self.renderer.run_model(planes, smpl, self.decoder, canonical, coordinates, directions, self.rendering_kwargs)
 
-    def forward(self, z, c, smpl, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+    def forward(self, z, c, smpl, canonical=False, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         # Render a batch of generated images.
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
-        return self.synthesis(ws, c, smpl, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
+        return self.synthesis(ws, c, smpl, canonical, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
 
 
 from training.networks_stylegan2 import FullyConnectedLayer
+import numpy as np
 
 class OSGDecoder(torch.nn.Module):
     def __init__(self, n_features, options):
         super().__init__()
         self.hidden_dim = 64
+        self.sigmoid_beta = torch.nn.Parameter(0.1 * torch.ones(1))
+        self.precomputed_sdf_grid = np.load('eg3d/training/precomputed_sdf_y-0.3.npy')
 
         self.net = torch.nn.Sequential(
-            FullyConnectedLayer(n_features, self.hidden_dim, lr_multiplier=options['decoder_lr_mul']),
+            FullyConnectedLayer(n_features + 3, self.hidden_dim, lr_multiplier=options['decoder_lr_mul']),
             torch.nn.Softplus(),
             FullyConnectedLayer(self.hidden_dim, 1 + options['decoder_output_dim'], lr_multiplier=options['decoder_lr_mul'])
         )
         
-    def forward(self, sampled_features, ray_directions):
+    def forward(self, sampled_coordinates, sampled_features, ray_directions):
         # Aggregate features
         sampled_features = sampled_features.mean(1)
-        x = sampled_features
+        x = torch.cat([sampled_coordinates, sampled_features], axis=-1)
 
         N, M, C = x.shape
         x = x.view(N*M, C)
@@ -132,5 +135,12 @@ class OSGDecoder(torch.nn.Module):
         x = self.net(x)
         x = x.view(N, M, -1)
         rgb = torch.sigmoid(x[..., 1:])*(1 + 2*0.001) - 0.001 # Uses sigmoid clamping from MipNeRF
-        sigma = x[..., 0:1]
-        return {'rgb': rgb, 'sigma': sigma}
+        delta_sdf = x[..., 0:1]
+        sdf_grid = torch.tensor(self.precomputed_sdf_grid).to(delta_sdf.device)
+        queried_sdf = torch.nn.functional.grid_sample(sdf_grid.repeat(N, 1, 1, 1, 1), sampled_coordinates[:,:,None,None,:3], padding_mode='border', align_corners=True)
+        queried_sdf = queried_sdf.reshape(N, -1, M).transpose(1,2)
+        sdf = queried_sdf
+        # from styleSDF
+        sigma = torch.sigmoid(-sdf / self.sigmoid_beta) / self.sigmoid_beta
+
+        return {'rgb': rgb, 'sigma': sigma, 'delta_sdf': delta_sdf}

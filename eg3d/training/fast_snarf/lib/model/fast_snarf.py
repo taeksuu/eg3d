@@ -37,9 +37,9 @@ class ForwardDeformer(torch.nn.Module):
         super().__init__()
 
         self.align_corners = True
-        self.skinning_mode = 'mlp'
+        self.skinning_mode = 'preset'
         self.res = 64
-        self.z_ratio = 4
+        self.z_ratio = 1
         self.softmax_mode = 'softmax'
         self.global_scale = 1.2
         self.soft_blend = 20
@@ -61,20 +61,26 @@ class ForwardDeformer(torch.nn.Module):
         
         gt_bbox = torch.cat([smpl_verts.min(dim=1).values, 
                              smpl_verts.max(dim=1).values], dim=0)
-        self.offset = -(gt_bbox[0] + gt_bbox[1])[None,None,:] / 2
+        self.offset1 = -(gt_bbox[0] + gt_bbox[1])[None,None,:] / 2
 
-        self.scale = torch.zeros_like(self.offset)
-        self.scale[...] = 1./((gt_bbox[1] - gt_bbox[0]).max()/2 * self.global_scale)
+        # self.scale = torch.zeros_like(self.offset)
+        # self.scale[...] = 1./((gt_bbox[1] - gt_bbox[0]).max()/2 * self.global_scale)
+        # self.scale[:,:,-1] = self.scale[:,:,-1] * self.z_ratio
+
+        # self.grid_denorm = grid/self.scale - self.offset
+
+        self.grid_denorm = grid
+        self.offset = torch.zeros_like(self.offset1)
+        self.offset[:,:,1] = self.offset[:,:,1] + 0.3
+        self.scale = torch.ones_like(self.offset)
         self.scale[:,:,-1] = self.scale[:,:,-1] * self.z_ratio
-
         self.grid_denorm = grid/self.scale - self.offset
 
         self.nn_smpl_weights = query_weights_smpl(self.grid_denorm, smpl_verts, smpl_server.weights_c).permute(1, 0).reshape(1,-1,d,h,w)
 
         if self.skinning_mode == 'preset':
             self.lbs_voxel_final = query_weights_smpl(self.grid_denorm, smpl_verts, smpl_server.weights_c)
-            self.lbs_voxel_final = self.lbs_voxel_final.permute(0,2,1).reshape(1,-1,d,h,w)
-
+            self.lbs_voxel_final = self.lbs_voxel_final.permute(1,0).reshape(1,-1,d,h,w)
         elif self.skinning_mode == 'voxel':
             lbs_voxel = 0.001 * torch.ones((1, 24, d, h, w), dtype=self.grid_denorm.dtype, device=self.grid_denorm.device)
             self.register_parameter('lbs_voxel', torch.nn.Parameter(lbs_voxel,requires_grad=True))

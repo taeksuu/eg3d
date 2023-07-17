@@ -34,8 +34,8 @@ from training.crosssection_utils import sample_cross_section
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw = np.clip(7680 // 6 // training_set.image_shape[2], 7, 32)
+    gh = np.clip(4320 // 4 // training_set.image_shape[1], 4, 32)
 
     all_indices = list(range(len(training_set)))
     rnd.shuffle(all_indices)
@@ -179,7 +179,7 @@ def training_loop(
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
         smpl = torch.empty([batch_gpu, G.smpl_dim], device=device)
-        img, _ = misc.print_module_summary(G, [z, c, smpl])
+        img, _, _, _ = misc.print_module_summary(G, [z, c, smpl])
         misc.print_module_summary(D, [img, c])
 
     # Setup augmentation.
@@ -378,6 +378,13 @@ def training_loop(
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
             save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw.png'), drange=[-1,1], grid_size=grid_size)
             save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+            out = [G_ema(z=z, c=c, smpl=smpl, canonical=True, noise_mode='const')[0] for z, c, smpl in zip(grid_z, grid_c, grid_smpl)]
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_cano.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw_cano.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_cano.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
 
             #--------------------
             # # Log forward-conditioned images
